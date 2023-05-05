@@ -9,7 +9,7 @@ from datasets import load_dataset # huggingface datasets
 
 # number of workers in .map() call
 # good number to use is ~order number of cpu cores // 2
-num_proc = 8
+num_proc = 42
 
 # takes 54GB in huggingface .cache dir, about 8M documents (8,013,769)
 dataset = load_dataset("openwebtext")
@@ -51,7 +51,7 @@ tokenized = split_dataset.map(
 # concatenate all the ids in each dataset into one large file we can use for training
 for split, dset in tokenized.items():
     arr_len = np.sum(dset['len'])
-    filename = os.path.join(os.path.dirname(__file__), f'{split}.bin')
+    filename = os.path.join('/mnt/efs/augment/user/carl/data/openwebtext', f'{split}.bin')
     dtype = np.uint16 # (can do since enc.max_token_value == 50256 is < 2**16)
     arr = np.memmap(filename, dtype=dtype, mode='w+', shape=(arr_len,))
     total_batches = 1024
