@@ -17,7 +17,7 @@ from torch.nn import functional as F
 
 import transformer_engine.pytorch as te
 
-# @torch.jit.script # good to enable when not using torch.compile, disable when using (our default)
+@torch.jit.script # good to enable when not using torch.compile, disable when using (our default)
 def new_gelu(x):
     """
     Implementation of the GELU activation function currently in Google BERT repo (identical to OpenAI GPT).
@@ -93,9 +93,9 @@ class Block(nn.Module):
 
     def __init__(self, config):
         super().__init__()
-        self.ln_1 = te.LayerNorm(config.e_embd, eps=1e-5)
+        self.ln_1 = te.LayerNorm(config.n_embd, eps=1e-5)
         self.attn = CausalSelfAttention(config)
-        self.ln_2 = te.LayerNorm(config.e_embd, eps=1e-5)
+        self.ln_2 = te.LayerNorm(config.n_embd, eps=1e-5)
         self.mlp = MLP(config)
 
     def forward(self, x):
