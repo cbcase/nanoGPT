@@ -111,8 +111,7 @@ torch.backends.cudnn.allow_tf32 = True # allow tf32 on cudnn
 device_type = 'cuda' if 'cuda' in device else 'cpu' # for later use in torch.autocast
 # note: float16 data type will automatically use a GradScaler
 ptdtype = {'float32': torch.float32, 'bfloat16': torch.bfloat16, 'float16': torch.float16}[dtype]
-## ctx = nullcontext() if device_type == 'cpu' else torch.amp.autocast(device_type=device_type, dtype=ptdtype)
-ctx = nullcontext()
+ctx = nullcontext() if device_type == 'cpu' else torch.amp.autocast(device_type=device_type, dtype=ptdtype)
 
 # poor man's data loader
 data_dir = os.path.join('/mnt/efs/augment/user/carl/data', dataset)
@@ -198,8 +197,6 @@ model.to(ptdtype)
 # initialize a GradScaler. If enabled=False scaler is a no-op
 scaler = torch.cuda.amp.GradScaler(enabled=(dtype == 'float16'))
 
-# FSDP the model
-# model = FSDP(model)
 
 # Flatten the model
 optimizer, flat_model_state = model.create_flat_optimizer(weight_decay, learning_rate, (beta1, beta2))
@@ -217,8 +214,6 @@ if compile:
     print("compiling the model... (takes a ~minute)")
     unoptimized_model = model
     model = torch.compile(model) # requires PyTorch 2.0
-
-# torch.cuda.profiler.start()
 
 # wrap model into DDP container
 if ddp:
@@ -254,64 +249,6 @@ def get_lr(it):
     coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio)) # coeff ranges 0..1
     return min_lr + coeff * (learning_rate - min_lr)
 
-## A bunch of cuda graphs stuff
-model.zero_grad(set_to_none=True)
-static_X = torch.randint(0, model_args['vocab_size'], size=(batch_size, block_size), dtype=torch.int64, device='cuda')
-static_Y = torch.randint(0, model_args['vocab_size'], size=(batch_size, block_size), dtype=torch.int64, device='cuda')
-
-graph_warmups = 5
-s = torch.cuda.Stream()
-s.wait_stream(torch.cuda.current_stream())
-with torch.cuda.stream(s):
-    for i in range(graph_warmups):
-        X, Y = get_batch('train')
-        lr = get_lr(iter_num + i) if decay_lr else learning_rate
-        for param_group in optimizer.param_groups:
-            param_group['lr'].copy_(lr)
-        with torch.no_grad():
-            static_X.copy_(X)
-            static_Y.copy_(Y)
-        static_logits, static_loss = model(static_X, static_Y)
-        static_loss.backward()
-        for p in model.parameters():
-            start, end = flat_model_state.param_addrs[p]
-            flat_model_state.grads()[start:end].copy_(p.grad.view(end - start))
-            p.grad = None
-        optimizer.step()
-g = torch.cuda.CUDAGraph()
-X, Y = get_batch('train')
-lr = get_lr(iter_num + graph_warmups) if decay_lr else learning_rate
-for param_group in optimizer.param_groups:
-    param_group['lr'].copy_(lr)
-with torch.no_grad():
-    static_X.copy_(X)
-    static_Y.copy_(Y)
-with torch.cuda.graph(g):
-    static_logits, static_loss = model(static_X, static_Y)
-    static_loss.backward()
-    for p in model.parameters():
-        start, end = flat_model_state.param_addrs[p]
-        flat_model_state.grads()[start:end].copy_(p.grad.view(end - start))
-        p.grad = None
-    optimizer.step()
-
-torch.cuda.synchronize()
-# torch.cuda.current_stream().wait_stream(s)
-# g = torch.cuda.CUDAGraph()
-# model.zero_grad(set_to_none=True)
-# with torch.cuda.graph(g):
-#     static_logits, static_loss = model(static_X, static_Y)
-#     static_loss.backward()
-#     for p in model.parameters():
-#         start, end = flat_model_state.param_addrs[p]
-#         flat_model_state.grads()[start:end].copy_(p.grad.view(end - start))
-#         p.grad = None
-
-
-# torch.cuda.synchronize()
-# sys.exit(0)
-
-
 # logging
 if wandb_log and master_process:
     import wandb
@@ -324,13 +261,7 @@ local_iter_num = 0 # number of iterations in the lifetime of this process
 raw_model = model.module if ddp else model # unwrap DDP container if needed
 running_mfu = -1.0
 
-iter_num += (graph_warmups + 1)
-local_iter_num += (graph_warmups + 1)
-
 while True:
-    # if iter_num == 20:
-    #    torch.cuda.profiler.stop()
-    #    sys.exit(0)
     # determine and set the learning rate for this iteration
     lr = get_lr(iter_num) if decay_lr else learning_rate
     for param_group in optimizer.param_groups:
@@ -376,31 +307,24 @@ while True:
             # looking at the source of that context manager, it just toggles this variable
             model.require_backward_grad_sync = (micro_step == gradient_accumulation_steps - 1)
         with ctx:
-            with torch.no_grad():
-                static_X.copy_(X)
-                static_Y.copy_(Y)
-            g.replay()
-            ##logits, loss = model(X, Y)
-            ##loss = loss / gradient_accumulation_steps # scale the loss to account for gradient accumulation
+            logits, loss = model(X, Y)
+            loss = loss / gradient_accumulation_steps # scale the loss to account for gradient accumulation
         # immediately async prefetch next batch while model is doing the forward pass on the GPU
         X, Y = get_batch('train')
         # backward pass, with gradient scaling if training in fp16
-        ## scaler.scale(loss).backward()
+        scaler.scale(loss).backward()
 
-    # for k in ["decay", "nodecay"]:
-    #     grads = flat_model_state.grads(k)
-    #     print(f"{k} grad mean: {grads.mean().item()}")
     # clip the gradient
     if grad_clip != 0.0:
         scaler.unscale_(optimizer)
         torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
     # step the optimizer and scaler if training in fp16
     for p in model.parameters():
-        # start, end = flat_model_state.param_addrs[p]
-        # flat_model_state.grads()[start:end].copy_(p.grad.view(end - start))
+        start, end = flat_model_state.param_addrs[p]
+        flat_model_state.grads()[start:end].copy_(p.grad.view(end - start))
         p.grad = None
-    ###scaler.step(optimizer)
-    ###scaler.update()
+    scaler.step(optimizer)
+    scaler.update()
     # flush the gradients as soon as we can, no need for this memory anymore
     ###optimizer.zero_grad(set_to_none=True)
 
@@ -411,8 +335,7 @@ while True:
     if iter_num % log_interval == 0 and master_process:
         # get loss as float. note: this is a CPU-GPU sync point
         # scale up to undo the division above, approximating the true total loss (exact would have been a sum)
-        # lossf = loss.item() * gradient_accumulation_steps
-        lossf = static_loss.item() * gradient_accumulation_steps
+        lossf = loss.item() * gradient_accumulation_steps
         if local_iter_num >= 5: # let the training loop settle a bit
             mfu = raw_model.estimate_mfu(batch_size * gradient_accumulation_steps, dt)
             running_mfu = mfu if running_mfu == -1.0 else 0.9*running_mfu + 0.1*mfu
