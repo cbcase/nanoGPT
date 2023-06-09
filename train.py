@@ -217,7 +217,8 @@ if compile:
 
 # wrap model into DDP container
 if ddp:
-    model = DDP(model, device_ids=[ddp_local_rank])
+    torch.distributed.broadcast(flat_model_state.params(), 0)
+    # model = DDP(model, device_ids=[ddp_local_rank])
 
 # helps estimate an arbitrarily accurate loss over either split using many batches
 @torch.no_grad()
@@ -258,7 +259,8 @@ if wandb_log and master_process:
 X, Y = get_batch('train') # fetch the very first batch
 t0 = time.time()
 local_iter_num = 0 # number of iterations in the lifetime of this process
-raw_model = model.module if ddp else model # unwrap DDP container if needed
+# raw_model = model.module if ddp else model # unwrap DDP container if needed
+raw_model = model
 running_mfu = -1.0
 
 while True:
@@ -323,12 +325,15 @@ while True:
         start, end = flat_model_state.param_addrs[p]
         flat_model_state.grads()[start:end].copy_(p.grad.view(end - start))
         p.grad = None
+    if ddp:
+        torch.distributed.all_reduce(flat_model_state.grads())
     scaler.step(optimizer)
     scaler.update()
     # flush the gradients as soon as we can, no need for this memory anymore
     ###optimizer.zero_grad(set_to_none=True)
 
     # timing and logging
+    torch.cuda.synchronize()
     t1 = time.time()
     dt = t1 - t0
     t0 = t1
