@@ -313,6 +313,7 @@ while True:
     optimizer.zero_grad(set_to_none=True)
 
     # timing and logging
+    torch.cuda.synchronize()
     t1 = time.time()
     dt = t1 - t0
     t0 = t1
