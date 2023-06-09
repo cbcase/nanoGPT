@@ -15,6 +15,10 @@ import torch
 import torch.nn as nn
 from torch.nn import functional as F
 
+import flat
+from mpadam import MixedPrecisionAdamW
+from rotary import RotaryEmbedding
+
 # @torch.jit.script # good to enable when not using torch.compile, disable when using (our default)
 def new_gelu(x):
     """
@@ -56,15 +60,44 @@ class CausalSelfAttention(nn.Module):
             # causal mask to ensure that attention is only applied to the left in the input sequence
             self.register_buffer("bias", torch.tril(torch.ones(config.block_size, config.block_size))
                                         .view(1, 1, config.block_size, config.block_size))
+        n_embd_per_head = config.n_embd // config.n_head
+        rotary_ndims = int(config.rotary_pct * n_embd_per_head)
+        self.rotary_emb = RotaryEmbedding(
+            rotary_ndims,
+            max_seq_length=config.block_size,
+            base=10000,
+            precision=torch.bfloat16,
+            rotary_ndims=rotary_ndims,
+            rotary_interleave=True,
+        )
 
     def forward(self, x):
         B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
 
         # calculate query, key, values for all heads in batch and move head forward to be the batch dim
         q, k, v  = self.c_attn(x).split(self.n_embd, dim=2)
-        k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
-        q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
-        v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
+
+        q = q.view(B, T, self.n_head, C // self.n_head)
+        k = k.view(B, T, self.n_head, C // self.n_head)
+        v = v.view(B, T, self.n_head, C // self.n_head)
+        # Q is [batch, seqlen, hidden]
+        # now [batch, seqlen, nheads, headdim]
+        # rotary expects [seqlen, batch, nheads, headdim]
+        q, k = self.rotary_emb.embed(
+            query_layer=q.transpose(0, 1),
+            key_layer=k.transpose(0, 1),
+            num_past_keys=0,
+        )
+        # q, k are now [seqlen, batch, nheads, headdim]
+        # v is [batch, seqlen, nheads, headdim]
+        # and we need [batch, nheads, seqlen, headdim]
+        q = q.permute(1, 2, 0, 3)
+        k = k.permute(1, 2, 0, 3)
+        v = v.transpose(1, 2)
+
+        # k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
+        # q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
+        # v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
 
         # causal self-attention; Self-attend: (B, nh, T, hs) x (B, nh, hs, T) -> (B, nh, T, T)
         if self.flash:
@@ -111,6 +144,20 @@ class Block(nn.Module):
         x = x + self.attn(self.ln_1(x))
         x = x + self.mlp(self.ln_2(x))
         return x
+    
+class GPTJBlock(nn.Module):
+
+    def __init__(self, config):
+        super().__init__()
+        self.ln = LayerNorm(config.n_embd, bias=config.bias)
+        self.attn = CausalSelfAttention(config)
+        self.mlp = MLP(config)
+
+    def forward(self, x):
+        post_ln = self.ln(x)
+        attn_out = self.attn(post_ln)
+        mlp_out = self.mlp(post_ln)
+        return x + attn_out + mlp_out
 
 @dataclass
 class GPTConfig:
@@ -121,6 +168,7 @@ class GPTConfig:
     n_embd: int = 768
     dropout: float = 0.0
     bias: bool = True # True: bias in Linears and LayerNorms, like GPT-2. False: a bit better and faster
+    rotary_pct = 0.5
 
 class GPT(nn.Module):
 
@@ -134,7 +182,7 @@ class GPT(nn.Module):
             wte = nn.Embedding(config.vocab_size, config.n_embd),
             wpe = nn.Embedding(config.block_size, config.n_embd),
             drop = nn.Dropout(config.dropout),
-            h = nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
+            h = nn.ModuleList([GPTJBlock(config) for _ in range(config.n_layer)]),
             ln_f = LayerNorm(config.n_embd, bias=config.bias),
         ))
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
@@ -142,7 +190,7 @@ class GPT(nn.Module):
         # "UserWarning: functional_call was passed multiple values for tied weights.
         # This behavior is deprecated and will be an error in future versions"
         # not 100% sure what this is, so far seems to be harmless. TODO investigate
-        self.transformer.wte.weight = self.lm_head.weight # https://paperswithcode.com/method/weight-tying
+        # self.transformer.wte.weight = self.lm_head.weight # https://paperswithcode.com/method/weight-tying
 
         # init all weights
         self.apply(self._init_weights)
@@ -190,7 +238,7 @@ class GPT(nn.Module):
 
         if targets is not None:
             # if we are given some desired targets also calculate the loss
-            logits = self.lm_head(x)
+            logits = self.lm_head(x).to(torch.float32)
             loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
         else:
             # inference-time mini-optimization: only forward the lm_head on the very last position
@@ -267,7 +315,7 @@ class GPT(nn.Module):
 
         return model
 
-    def configure_optimizers(self, weight_decay, learning_rate, betas, device_type):
+    def split_decay_params(self):
         # start with all of the candidate parameters
         param_dict = {pn: p for pn, p in self.named_parameters()}
         # filter out those that do not require grad
@@ -276,6 +324,25 @@ class GPT(nn.Module):
         # i.e. all weight tensors in matmuls + embeddings decay, all biases and layernorms don't.
         decay_params = [p for n, p in param_dict.items() if p.dim() >= 2]
         nodecay_params = [p for n, p in param_dict.items() if p.dim() < 2]
+        return decay_params, nodecay_params
+    
+    def create_flat_optimizer(self, weight_decay, learning_rate, betas):
+        decay_params, nodecay_params = self.split_decay_params()
+        flat_model_state = flat.flatten_model({"decay": decay_params, "nodecay": nodecay_params})
+        optim_groups = [
+            (flat_model_state.params("decay"), flat_model_state.grads("decay"), {"weight_decay": weight_decay}),
+            (flat_model_state.params("nodecay"), flat_model_state.grads("nodecay"), {"weight_decay": 0.0}),
+        ]
+        num_decay_params = sum(p.numel() for p in decay_params)
+        num_nodecay_params = sum(p.numel() for p in nodecay_params)
+        print(f"num decayed parameter tensors: {len(decay_params)}, with {num_decay_params:,} parameters")
+        print(f"num non-decayed parameter tensors: {len(nodecay_params)}, with {num_nodecay_params:,} parameters")
+        optimizer = MixedPrecisionAdamW(optim_groups, lr=learning_rate, betas=betas)
+        return optimizer, flat_model_state
+
+
+    def configure_optimizers(self, weight_decay, learning_rate, betas, device_type):
+        decay_params, nodecay_params = self.split_decay_params()
         optim_groups = [
             {'params': decay_params, 'weight_decay': weight_decay},
             {'params': nodecay_params, 'weight_decay': 0.0}
