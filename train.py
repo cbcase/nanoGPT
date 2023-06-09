@@ -21,7 +21,6 @@ import time
 import math
 import pickle
 from contextlib import nullcontext
-import sys
 
 import numpy as np
 import torch
@@ -31,7 +30,6 @@ from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 
 from model import GPTConfig, GPT
 
-import flat
 
 # -----------------------------------------------------------------------------
 # default config values designed to train a gpt2 (124M) on OpenWebText
@@ -191,20 +189,11 @@ if block_size < model.config.block_size:
     model_args['block_size'] = block_size # so that the checkpoint will have the right value
 model.to(device)
 
-# Cast model in-place
-model.to(ptdtype)
-
 # initialize a GradScaler. If enabled=False scaler is a no-op
 scaler = torch.cuda.amp.GradScaler(enabled=(dtype == 'float16'))
 
-
-# Flatten the model
-optimizer, flat_model_state = model.create_flat_optimizer(weight_decay, learning_rate, (beta1, beta2))
-# decay_params, nodecay_params = model.split_decay_params()
-# flat_model_state = flat.flatten_model({"decay": decay_params, "nodecay": nodecay_params})
-
 # optimizer
-# optimizer = model.configure_optimizers(weight_decay, learning_rate, (beta1, beta2), device_type)
+optimizer = model.configure_optimizers(weight_decay, learning_rate, (beta1, beta2), device_type)
 if init_from == 'resume':
     optimizer.load_state_dict(checkpoint['optimizer'])
 checkpoint = None # free up memory
@@ -265,8 +254,7 @@ while True:
     # determine and set the learning rate for this iteration
     lr = get_lr(iter_num) if decay_lr else learning_rate
     for param_group in optimizer.param_groups:
-        # param_group['lr'] = lr
-        param_group['lr'].copy_(lr)
+        param_group['lr'] = lr
 
     # evaluate the loss on train/val sets and write checkpoints
     # if iter_num % eval_interval == 0 and master_process:
@@ -319,14 +307,10 @@ while True:
         scaler.unscale_(optimizer)
         torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
     # step the optimizer and scaler if training in fp16
-    for p in model.parameters():
-        start, end = flat_model_state.param_addrs[p]
-        flat_model_state.grads()[start:end].copy_(p.grad.view(end - start))
-        p.grad = None
     scaler.step(optimizer)
     scaler.update()
     # flush the gradients as soon as we can, no need for this memory anymore
-    ###optimizer.zero_grad(set_to_none=True)
+    optimizer.zero_grad(set_to_none=True)
 
     # timing and logging
     t1 = time.time()

@@ -15,8 +15,6 @@ import torch
 import torch.nn as nn
 from torch.nn import functional as F
 
-import flat
-from mpadam import MixedPrecisionAdamW
 from rotary import RotaryEmbedding
 
 # @torch.jit.script # good to enable when not using torch.compile, disable when using (our default)
@@ -325,20 +323,6 @@ class GPT(nn.Module):
         decay_params = [p for n, p in param_dict.items() if p.dim() >= 2]
         nodecay_params = [p for n, p in param_dict.items() if p.dim() < 2]
         return decay_params, nodecay_params
-    
-    def create_flat_optimizer(self, weight_decay, learning_rate, betas):
-        decay_params, nodecay_params = self.split_decay_params()
-        flat_model_state = flat.flatten_model({"decay": decay_params, "nodecay": nodecay_params})
-        optim_groups = [
-            (flat_model_state.params("decay"), flat_model_state.grads("decay"), {"weight_decay": weight_decay}),
-            (flat_model_state.params("nodecay"), flat_model_state.grads("nodecay"), {"weight_decay": 0.0}),
-        ]
-        num_decay_params = sum(p.numel() for p in decay_params)
-        num_nodecay_params = sum(p.numel() for p in nodecay_params)
-        print(f"num decayed parameter tensors: {len(decay_params)}, with {num_decay_params:,} parameters")
-        print(f"num non-decayed parameter tensors: {len(nodecay_params)}, with {num_nodecay_params:,} parameters")
-        optimizer = MixedPrecisionAdamW(optim_groups, lr=learning_rate, betas=betas)
-        return optimizer, flat_model_state
 
 
     def configure_optimizers(self, weight_decay, learning_rate, betas, device_type):
