@@ -85,6 +85,7 @@ config = {k: globals()[k] for k in config_keys} # will be useful for logging
 # various inits, derived attributes, I/O setup
 ddp = int(os.environ.get('RANK', -1)) != -1 # is this a ddp run?
 if ddp:
+    os.environ["NCCL_ASYNC_ERROR_HANDLING"] = "0"
     init_process_group(backend=backend)
     ddp_rank = int(os.environ['RANK'])
     ddp_local_rank = int(os.environ['LOCAL_RANK'])
@@ -222,7 +223,8 @@ if compile:
 
 # wrap model into DDP container
 if ddp:
-    model = DDP(model, device_ids=[ddp_local_rank])
+    torch.distributed.broadcast(flat_model_state.params(), 0)
+    # model = DDP(model, device_ids=[ddp_local_rank])
 
 # helps estimate an arbitrarily accurate loss over either split using many batches
 @torch.no_grad()
@@ -259,7 +261,7 @@ model.zero_grad(set_to_none=True)
 static_X = torch.randint(0, model_args['vocab_size'], size=(batch_size, block_size), dtype=torch.int64, device='cuda')
 static_Y = torch.randint(0, model_args['vocab_size'], size=(batch_size, block_size), dtype=torch.int64, device='cuda')
 
-graph_warmups = 5
+graph_warmups = 15
 s = torch.cuda.Stream()
 s.wait_stream(torch.cuda.current_stream())
 with torch.cuda.stream(s):
@@ -277,6 +279,8 @@ with torch.cuda.stream(s):
             start, end = flat_model_state.param_addrs[p]
             flat_model_state.grads()[start:end].copy_(p.grad.view(end - start))
             p.grad = None
+        if ddp:
+            torch.distributed.all_reduce(flat_model_state.grads())
         optimizer.step()
 g = torch.cuda.CUDAGraph()
 X, Y = get_batch('train')
@@ -293,6 +297,8 @@ with torch.cuda.graph(g):
         start, end = flat_model_state.param_addrs[p]
         flat_model_state.grads()[start:end].copy_(p.grad.view(end - start))
         p.grad = None
+    if ddp:
+        torch.distributed.all_reduce(flat_model_state.grads())
     optimizer.step()
 
 torch.cuda.synchronize()
@@ -321,7 +327,7 @@ if wandb_log and master_process:
 X, Y = get_batch('train') # fetch the very first batch
 t0 = time.time()
 local_iter_num = 0 # number of iterations in the lifetime of this process
-raw_model = model.module if ddp else model # unwrap DDP container if needed
+raw_model = model # model.module if ddp else model # unwrap DDP container if needed
 running_mfu = -1.0
 
 iter_num += (graph_warmups + 1)
@@ -405,6 +411,7 @@ while True:
     ###optimizer.zero_grad(set_to_none=True)
 
     # timing and logging
+    torch.cuda.synchronize()
     t1 = time.time()
     dt = t1 - t0
     t0 = t1
