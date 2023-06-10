@@ -99,6 +99,7 @@ else:
     # if not ddp, we are running on a single gpu, and one process
     master_process = True
     seed_offset = 0
+    ddp_rank = 0
     ddp_world_size = 1
 tokens_per_iter = gradient_accumulation_steps * ddp_world_size * batch_size * block_size
 print(f"tokens per iteration will be: {tokens_per_iter:,}")
@@ -199,7 +200,8 @@ scaler = torch.cuda.amp.GradScaler(enabled=(dtype == 'float16'))
 
 
 # Flatten the model
-optimizer, flat_model_state = model.create_flat_optimizer(weight_decay, learning_rate, (beta1, beta2))
+optimizer, flat_model_state = model.create_flat_optimizer(weight_decay, learning_rate, (beta1, beta2),
+                                                          ddp_rank, ddp_world_size)
 # decay_params, nodecay_params = model.split_decay_params()
 # flat_model_state = flat.flatten_model({"decay": decay_params, "nodecay": nodecay_params})
 
@@ -326,9 +328,15 @@ while True:
         flat_model_state.grads()[start:end].copy_(p.grad.view(end - start))
         p.grad = None
     if ddp:
-        torch.distributed.all_reduce(flat_model_state.grads())
-    scaler.step(optimizer)
-    scaler.update()
+        # reduce_scatter flat grads
+        torch.distributed.reduce_scatter_tensor(flat_model_state.dist_grads(), flat_model_state.grads())
+        optimizer.step()
+        torch.distributed.all_gather_into_tensor(flat_model_state.params(), flat_model_state.dist_params())
+
+        ### torch.distributed.all_reduce(flat_model_state.grads())
+    else:
+        scaler.step(optimizer)
+        scaler.update()
     # flush the gradients as soon as we can, no need for this memory anymore
     ###optimizer.zero_grad(set_to_none=True)
 

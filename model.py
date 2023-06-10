@@ -326,12 +326,14 @@ class GPT(nn.Module):
         nodecay_params = [p for n, p in param_dict.items() if p.dim() < 2]
         return decay_params, nodecay_params
     
-    def create_flat_optimizer(self, weight_decay, learning_rate, betas):
+    def create_flat_optimizer(self, weight_decay, learning_rate, betas,
+                              dist_rank=0, dist_world_size=1):
         decay_params, nodecay_params = self.split_decay_params()
-        flat_model_state = flat.flatten_model({"decay": decay_params, "nodecay": nodecay_params})
+        flat_model_state = flat.flatten_model({"decay": decay_params, "nodecay": nodecay_params},
+                                              dist_rank, dist_world_size)
         optim_groups = [
-            (flat_model_state.params("decay"), flat_model_state.grads("decay"), {"weight_decay": weight_decay}),
-            (flat_model_state.params("nodecay"), flat_model_state.grads("nodecay"), {"weight_decay": 0.0}),
+            (flat_model_state.dist_params("decay"), flat_model_state.dist_grads("decay"), {"weight_decay": weight_decay}),
+            (flat_model_state.dist_params("nodecay"), flat_model_state.dist_grads("nodecay"), {"weight_decay": 0.0}),
         ]
         num_decay_params = sum(p.numel() for p in decay_params)
         num_nodecay_params = sum(p.numel() for p in nodecay_params)
