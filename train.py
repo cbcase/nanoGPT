@@ -100,6 +100,7 @@ else:
     # if not ddp, we are running on a single gpu, and one process
     master_process = True
     seed_offset = 0
+    ddp_rank = 0
     ddp_world_size = 1
 tokens_per_iter = gradient_accumulation_steps * ddp_world_size * batch_size * block_size
 print(f"tokens per iteration will be: {tokens_per_iter:,}")
@@ -199,11 +200,10 @@ model.to(ptdtype)
 # initialize a GradScaler. If enabled=False scaler is a no-op
 scaler = torch.cuda.amp.GradScaler(enabled=(dtype == 'float16'))
 
-# FSDP the model
-# model = FSDP(model)
 
 # Flatten the model
-optimizer, flat_model_state = model.create_flat_optimizer(weight_decay, learning_rate, (beta1, beta2))
+optimizer, flat_model_state = model.create_flat_optimizer(weight_decay, learning_rate, (beta1, beta2),
+                                                          ddp_rank, ddp_world_size)
 # decay_params, nodecay_params = model.split_decay_params()
 # flat_model_state = flat.flatten_model({"decay": decay_params, "nodecay": nodecay_params})
 
@@ -218,8 +218,6 @@ if compile:
     print("compiling the model... (takes a ~minute)")
     unoptimized_model = model
     model = torch.compile(model) # requires PyTorch 2.0
-
-# torch.cuda.profiler.start()
 
 # wrap model into DDP container
 if ddp:
@@ -280,8 +278,11 @@ with torch.cuda.stream(s):
             flat_model_state.grads()[start:end].copy_(p.grad.view(end - start))
             p.grad = None
         if ddp:
-            torch.distributed.all_reduce(flat_model_state.grads())
-        optimizer.step()
+            torch.distributed.reduce_scatter_tensor(flat_model_state.dist_grads(), flat_model_state.grads())
+            optimizer.step()
+            torch.distributed.all_gather_into_tensor(flat_model_state.params(), flat_model_state.dist_params())
+        else:
+            optimizer.step()
 g = torch.cuda.CUDAGraph()
 X, Y = get_batch('train')
 lr = get_lr(iter_num + graph_warmups) if decay_lr else learning_rate
@@ -298,25 +299,13 @@ with torch.cuda.graph(g):
         flat_model_state.grads()[start:end].copy_(p.grad.view(end - start))
         p.grad = None
     if ddp:
-        torch.distributed.all_reduce(flat_model_state.grads())
-    optimizer.step()
+        torch.distributed.reduce_scatter_tensor(flat_model_state.dist_grads(), flat_model_state.grads())
+        optimizer.step()
+        torch.distributed.all_gather_into_tensor(flat_model_state.params(), flat_model_state.dist_params())
+    else:
+        optimizer.step()
 
 torch.cuda.synchronize()
-# torch.cuda.current_stream().wait_stream(s)
-# g = torch.cuda.CUDAGraph()
-# model.zero_grad(set_to_none=True)
-# with torch.cuda.graph(g):
-#     static_logits, static_loss = model(static_X, static_Y)
-#     static_loss.backward()
-#     for p in model.parameters():
-#         start, end = flat_model_state.param_addrs[p]
-#         flat_model_state.grads()[start:end].copy_(p.grad.view(end - start))
-#         p.grad = None
-
-
-# torch.cuda.synchronize()
-# sys.exit(0)
-
 
 # logging
 if wandb_log and master_process:
@@ -327,16 +316,14 @@ if wandb_log and master_process:
 X, Y = get_batch('train') # fetch the very first batch
 t0 = time.time()
 local_iter_num = 0 # number of iterations in the lifetime of this process
-raw_model = model # model.module if ddp else model # unwrap DDP container if needed
+# raw_model = model.module if ddp else model # unwrap DDP container if needed
+raw_model = model
 running_mfu = -1.0
 
 iter_num += (graph_warmups + 1)
 local_iter_num += (graph_warmups + 1)
 
 while True:
-    # if iter_num == 20:
-    #    torch.cuda.profiler.stop()
-    #    sys.exit(0)
     # determine and set the learning rate for this iteration
     lr = get_lr(iter_num) if decay_lr else learning_rate
     for param_group in optimizer.param_groups:
@@ -386,27 +373,16 @@ while True:
                 static_X.copy_(X)
                 static_Y.copy_(Y)
             g.replay()
-            ##logits, loss = model(X, Y)
-            ##loss = loss / gradient_accumulation_steps # scale the loss to account for gradient accumulation
         # immediately async prefetch next batch while model is doing the forward pass on the GPU
         X, Y = get_batch('train')
-        # backward pass, with gradient scaling if training in fp16
-        ## scaler.scale(loss).backward()
 
-    # for k in ["decay", "nodecay"]:
-    #     grads = flat_model_state.grads(k)
-    #     print(f"{k} grad mean: {grads.mean().item()}")
     # clip the gradient
     if grad_clip != 0.0:
         scaler.unscale_(optimizer)
         torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
     # step the optimizer and scaler if training in fp16
     for p in model.parameters():
-        # start, end = flat_model_state.param_addrs[p]
-        # flat_model_state.grads()[start:end].copy_(p.grad.view(end - start))
         p.grad = None
-    ###scaler.step(optimizer)
-    ###scaler.update()
     # flush the gradients as soon as we can, no need for this memory anymore
     ###optimizer.zero_grad(set_to_none=True)
 
@@ -418,7 +394,6 @@ while True:
     if iter_num % log_interval == 0 and master_process:
         # get loss as float. note: this is a CPU-GPU sync point
         # scale up to undo the division above, approximating the true total loss (exact would have been a sum)
-        # lossf = loss.item() * gradient_accumulation_steps
         lossf = static_loss.item() * gradient_accumulation_steps
         if local_iter_num >= 5: # let the training loop settle a bit
             mfu = raw_model.estimate_mfu(batch_size * gradient_accumulation_steps, dt)
