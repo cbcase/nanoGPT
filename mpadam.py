@@ -26,8 +26,8 @@ class MixedPrecisionAdamW():
 
     def step(self):
         for group in self.param_groups:
+            # TODO: not sure we're incrementing the step in the right place
             step = group['step']
-            # step += torch.tensor([1], dtype=torch.int, device=step.device)
             step += self.int_one
 
 
