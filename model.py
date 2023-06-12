@@ -233,7 +233,8 @@ class GPT(nn.Module):
         pos_emb = self.transformer.wpe(pos) # position embeddings of shape (1, t, n_embd)
         x = self.transformer.drop(tok_emb + pos_emb)
         for block in self.transformer.h:
-            x = block(x)
+            # x = block(x)
+            x = torch.utils.checkpoint.checkpoint(block, x, preserve_rng_state=False)
         x = self.transformer.ln_f(x)
 
         if targets is not None:

@@ -115,7 +115,7 @@ ptdtype = {'float32': torch.float32, 'bfloat16': torch.bfloat16, 'float16': torc
 ctx = nullcontext() if device_type == 'cpu' else torch.amp.autocast(device_type=device_type, dtype=ptdtype)
 
 # poor man's data loader
-data_dir = os.path.join('/mnt/efs/augment/user/carl/data', dataset)
+data_dir = os.path.join('/mnt/tmpfs', dataset)
 train_data = np.memmap(os.path.join(data_dir, 'train.bin'), dtype=np.uint16, mode='r')
 val_data = np.memmap(os.path.join(data_dir, 'val.bin'), dtype=np.uint16, mode='r')
 def get_batch(split):
@@ -265,7 +265,14 @@ local_iter_num = 0 # number of iterations in the lifetime of this process
 raw_model = model
 running_mfu = -1.0
 
+torch.cuda.synchronize()
+torch.cuda.profiler.start()
+
 while True:
+    if iter_num > 20:
+        torch.cuda.profiler.stop()
+        sys.exit(0)
+
     # determine and set the learning rate for this iteration
     lr = get_lr(iter_num) if decay_lr else learning_rate
     for param_group in optimizer.param_groups:
@@ -316,11 +323,12 @@ while True:
         # immediately async prefetch next batch while model is doing the forward pass on the GPU
         X, Y = get_batch('train')
         # backward pass, with gradient scaling if training in fp16
-        scaler.scale(loss).backward()
+        # scaler.scale(loss).backward()
+        loss.backward()
 
     # clip the gradient
     if grad_clip != 0.0:
-        scaler.unscale_(optimizer)
+        # scaler.unscale_(optimizer)
         torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
     # step the optimizer and scaler if training in fp16
     for p in model.parameters():
@@ -335,8 +343,9 @@ while True:
 
         ### torch.distributed.all_reduce(flat_model_state.grads())
     else:
-        scaler.step(optimizer)
-        scaler.update()
+        optimizer.step()
+        #scaler.step(optimizer)
+        #scaler.update()
     # flush the gradients as soon as we can, no need for this memory anymore
     ###optimizer.zero_grad(set_to_none=True)
 
