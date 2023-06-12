@@ -1,18 +1,28 @@
+from typing import Dict, Iterable, Tuple, Union
+
 import torch
+from torch import Tensor
+from torch.nn import Parameter
+
 
 class FlatModelState:
-    def __init__(self, params_buf, grads_buf, param_addrs, group_addrs={},
-                 dist_rank=0, dist_world_size=1):
+    def __init__(
+        self,
+        params_buf: torch.Tensor,
+        grads_buf: torch.Tensor,
+        param_addrs: Dict[Parameter, Tuple[int, int]],
+        group_addrs: Dict[str, Tuple[int, int]] = {},
+        dist_rank: int = 0,
+        dist_world_size: int = 1,
+    ):
         assert params_buf.numel() == grads_buf.numel()
         assert params_buf.numel() % dist_world_size == 0
         self.params_buf = params_buf  # Flat buffer of parameters
         self.grads_buf = grads_buf  # Flat buffer of grads
         self.param_addrs = param_addrs  # map param -> (start, end)
         self.group_addrs = group_addrs  # map group_key -> (start, end)
-        ## self.end = max(x[1] for x in self.param_addrs.values())  # length of valid data in buffers
         self.dist_rank = dist_rank
         self.dist_world_size = dist_world_size
-
 
     def _range_of(self, group_key=None):
         if not group_key:
@@ -54,7 +64,12 @@ class FlatModelState:
     def device(self):
         return self.grads_buf.dtype
 
-def flatten_model(params, dist_rank=0, dist_world_size=1):
+
+def flatten_model(
+    params: Union[Dict[str, Iterable[Parameter]], Iterable[Parameter]],
+    dist_rank: int = 0,
+    dist_world_size: int = 1,
+) -> FlatModelState:
     assert len(params) > 0
     if isinstance(params, dict):
         all_params = [p for some_params in params.values() for p in some_params]
@@ -68,8 +83,9 @@ def flatten_model(params, dist_rank=0, dist_world_size=1):
             group_start = min(param_addrs[p][0] for p in group_params)
             group_end = max(param_addrs[p][1] for p in group_params)
             group_addrs[group_name] = (group_start, group_end)
-    return FlatModelState(params_buf, grads_buf, param_addrs, group_addrs,
-                          dist_rank, dist_world_size)
+    return FlatModelState(
+        params_buf, grads_buf, param_addrs, group_addrs, dist_rank, dist_world_size
+    )
 
 
 def round_up(x: int, alignment: int) -> int:
@@ -79,11 +95,16 @@ def round_up(x: int, alignment: int) -> int:
     else:
         return x + alignment - residual
 
-def flatten_params(params, dist_world_size=1):
+
+def flatten_params(
+    params: Iterable[Parameter], dist_world_size: int = 1
+) -> Tuple[Tensor, Dict[Parameter, Tuple[int, int]]]:
     aparam = next(iter(params))
+
     # Align everything to 128 byte boundaries
     def _align(x):
         return round_up(x, 128 // aparam.element_size())
+
     param_addrs = {}
     start, end = 0, 0
     for p in params:
@@ -91,7 +112,9 @@ def flatten_params(params, dist_world_size=1):
         param_addrs[p] = (start, end)
         start = _align(end)
 
-    buf_numel = round_up(end, dist_world_size)  # Ensure buf is divisible by world size for uniform all_gather
+    buf_numel = round_up(
+        end, dist_world_size
+    )  # Ensure buf is divisible by world size for uniform all_gather
     params_buf = torch.empty(buf_numel, dtype=aparam.dtype, device=aparam.device)
     for p in params:
         start, end = param_addrs[p]
