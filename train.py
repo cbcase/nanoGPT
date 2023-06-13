@@ -117,7 +117,7 @@ ptdtype = {'float32': torch.float32, 'bfloat16': torch.bfloat16, 'float16': torc
 ctx = nullcontext()
 
 # poor man's data loader
-data_dir = os.path.join('/mnt/efs/augment/user/carl/data', dataset)
+data_dir = os.path.join('/mnt/tmpfs', dataset)
 train_data = np.memmap(os.path.join(data_dir, 'train.bin'), dtype=np.uint16, mode='r')
 val_data = np.memmap(os.path.join(data_dir, 'val.bin'), dtype=np.uint16, mode='r')
 def get_batch(split):
@@ -259,6 +259,13 @@ model.zero_grad(set_to_none=True)
 static_X = torch.randint(0, model_args['vocab_size'], size=(batch_size, block_size), dtype=torch.int64, device='cuda')
 static_Y = torch.randint(0, model_args['vocab_size'], size=(batch_size, block_size), dtype=torch.int64, device='cuda')
 
+static_embed = torch.randn((batch_size, block_size, n_embd), dtype=ptdtype, device='cuda', requires_grad=True)
+model.transformer.wte.weight.grad = torch.randn((50304, n_embd), dtype=ptdtype, device='cuda')
+
+pnames = {}
+for n, p in model.named_parameters():
+    pnames[p] = n
+
 graph_warmups = 15
 s = torch.cuda.Stream()
 s.wait_stream(torch.cuda.current_stream())
@@ -269,14 +276,19 @@ with torch.cuda.stream(s):
         for param_group in optimizer.param_groups:
             param_group['lr'].copy_(lr)
         with torch.no_grad():
-            static_X.copy_(X)
+            # static_X.copy_(X)
             static_Y.copy_(Y)
-        static_logits, static_loss = model(static_X, static_Y)
+        static_logits, static_loss = model.post_embed(static_embed, static_Y)
+        # static_logits, static_loss = model(static_X, static_Y)
         static_loss.backward()
         for p in model.parameters():
             start, end = flat_model_state.param_addrs[p]
+            if p.grad is None:
+                print('MISSING GRAD', p.shape, pnames[p])
             flat_model_state.grads()[start:end].copy_(p.grad.view(end - start))
-            p.grad = None
+            if p is not model.transformer.wte.weight:
+                p.grad = None
+        static_embed.grad = None
         if ddp:
             torch.distributed.reduce_scatter_tensor(flat_model_state.dist_grads(), flat_model_state.grads())
             optimizer.step()
@@ -289,15 +301,18 @@ lr = get_lr(iter_num + graph_warmups) if decay_lr else learning_rate
 for param_group in optimizer.param_groups:
     param_group['lr'].copy_(lr)
 with torch.no_grad():
-    static_X.copy_(X)
+    # static_X.copy_(X)
     static_Y.copy_(Y)
 with torch.cuda.graph(g):
-    static_logits, static_loss = model(static_X, static_Y)
+    static_logits, static_loss = model.post_embed(static_embed, static_Y)
+    # static_logits, static_loss = model(static_X, static_Y)
     static_loss.backward()
     for p in model.parameters():
         start, end = flat_model_state.param_addrs[p]
         flat_model_state.grads()[start:end].copy_(p.grad.view(end - start))
-        p.grad = None
+        if p is not model.transformer.wte.weight:
+            p.grad = None
+    static_embed.grad = None
     if ddp:
         torch.distributed.reduce_scatter_tensor(flat_model_state.dist_grads(), flat_model_state.grads())
         optimizer.step()
@@ -370,7 +385,7 @@ while True:
             model.require_backward_grad_sync = (micro_step == gradient_accumulation_steps - 1)
         with ctx:
             with torch.no_grad():
-                static_X.copy_(X)
+                # static_X.copy_(X)
                 static_Y.copy_(Y)
             g.replay()
         # immediately async prefetch next batch while model is doing the forward pass on the GPU
@@ -378,11 +393,13 @@ while True:
 
     # clip the gradient
     if grad_clip != 0.0:
-        scaler.unscale_(optimizer)
+        # scaler.unscale_(optimizer)
         torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
     # step the optimizer and scaler if training in fp16
     for p in model.parameters():
-        p.grad = None
+        if p is not model.transformer.wte.weight:
+            p.grad = None
+    static_embed.grad = None
     # flush the gradients as soon as we can, no need for this memory anymore
     ###optimizer.zero_grad(set_to_none=True)
 

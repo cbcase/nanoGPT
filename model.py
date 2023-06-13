@@ -66,7 +66,7 @@ class CausalSelfAttention(nn.Module):
             rotary_ndims,
             max_seq_length=config.block_size,
             base=10000,
-            precision=torch.bfloat16,
+            precision=torch.float16, #torch.bfloat16,
             rotary_ndims=rotary_ndims,
             rotary_interleave=True,
         )
@@ -180,7 +180,7 @@ class GPT(nn.Module):
 
         self.transformer = nn.ModuleDict(dict(
             wte = nn.Embedding(config.vocab_size, config.n_embd),
-            wpe = nn.Embedding(config.block_size, config.n_embd),
+            # wpe = nn.Embedding(config.block_size, config.n_embd),
             drop = nn.Dropout(config.dropout),
             h = nn.ModuleList([GPTJBlock(config) for _ in range(config.n_layer)]),
             ln_f = LayerNorm(config.n_embd, bias=config.bias),
@@ -211,7 +211,8 @@ class GPT(nn.Module):
         """
         n_params = sum(p.numel() for p in self.parameters())
         if non_embedding:
-            n_params -= self.transformer.wpe.weight.numel()
+            pass
+            # n_params -= self.transformer.wpe.weight.numel()
         return n_params
 
     def _init_weights(self, module):
@@ -222,7 +223,7 @@ class GPT(nn.Module):
         elif isinstance(module, nn.Embedding):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
-    def forward(self, idx, targets=None):
+    def embed_only(self, idx):
         device = idx.device
         b, t = idx.size()
         assert t <= self.config.block_size, f"Cannot forward sequence of length {t}, block size is only {self.config.block_size}"
@@ -230,10 +231,14 @@ class GPT(nn.Module):
 
         # forward the GPT model itself
         tok_emb = self.transformer.wte(idx) # token embeddings of shape (b, t, n_embd)
-        pos_emb = self.transformer.wpe(pos) # position embeddings of shape (1, t, n_embd)
-        x = self.transformer.drop(tok_emb + pos_emb)
+        # pos_emb = self.transformer.wpe(pos) # position embeddings of shape (1, t, n_embd)
+        x = self.transformer.drop(tok_emb) # + pos_emb)
+        return x
+
+    def post_embed(self, x, targets=None):
         for block in self.transformer.h:
-            x = block(x)
+            # x = block(x)
+            x = torch.utils.checkpoint.checkpoint(block, x, preserve_rng_state=False)
         x = self.transformer.ln_f(x)
 
         if targets is not None:
@@ -247,10 +252,15 @@ class GPT(nn.Module):
 
         return logits, loss
 
+    def forward(self, idx, targets=None):
+        x = self.embed_only(idx)
+        return self.post_embed(x, targets)
+
     def crop_block_size(self, block_size):
         # model surgery to decrease the block size if necessary
         # e.g. we may load the GPT2 pretrained model checkpoint (block size 1024)
         # but want to use a smaller block size for some smaller, simpler model
+        assert False
         assert block_size <= self.config.block_size
         self.config.block_size = block_size
         self.transformer.wpe.weight = nn.Parameter(self.transformer.wpe.weight[:block_size])
