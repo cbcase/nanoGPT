@@ -19,6 +19,44 @@ import flat
 from mpadam import MixedPrecisionAdamW
 from rotary import RotaryEmbedding
 
+class SplitReturnLinear(torch.nn.Linear):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+
+    def forward(self, input):
+        output = F.linear(input, self.weight)
+        return output, self.bias
+
+@torch.jit.script
+def bias_gelu(bias, y):
+    x = bias + y
+    return x * 0.5 * (1.0 + torch.tanh(0.79788456 * x * (1 + 0.044715 * x * x)))
+
+@torch.jit.script
+def bias_gelu_backward(g, bias, y):
+    x = bias + y
+    tanh_out = torch.tanh(0.79788456 * x * (1 + 0.044715 * x * x))
+    # sqrt(2/pi) * 3 * 0.044715 -> 0.1070322243
+    ff = 0.5 * x * (
+        (1 - tanh_out * tanh_out) * (0.79788456 + 0.1070322243 * x * x)
+    ) + 0.5 * (1 + tanh_out)
+    return ff * g
+
+class BiasGeluFunction(torch.autograd.Function):
+    @staticmethod
+    # bias is an optional argument
+    def forward(ctx, input, bias):
+        ctx.save_for_backward(input, bias)
+        return bias_gelu(bias, input)
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        input, bias = ctx.saved_tensors
+        tmp = bias_gelu_backward(grad_output, bias, input)
+        return tmp, tmp
+    
+bias_gelu_fn = BiasGeluFunction.apply
+
 # @torch.jit.script # good to enable when not using torch.compile, disable when using (our default)
 def new_gelu(x):
     """
@@ -120,13 +158,16 @@ class MLP(nn.Module):
 
     def __init__(self, config):
         super().__init__()
-        self.c_fc    = nn.Linear(config.n_embd, 4 * config.n_embd, bias=config.bias)
+        # self.c_fc    = nn.Linear(config.n_embd, 4 * config.n_embd, bias=config.bias)
+        self.c_fc = SplitReturnLinear(config.n_embd, 4 * config.n_embd, bias=config.bias)
         self.c_proj  = nn.Linear(4 * config.n_embd, config.n_embd, bias=config.bias)
         self.dropout = nn.Dropout(config.dropout)
 
     def forward(self, x):
-        x = self.c_fc(x)
-        x = new_gelu(x)
+        # x = self.c_fc(x)
+        # x = new_gelu(x)
+        x, bias = self.c_fc(x)
+        x = bias_gelu_fn(bias, x)
         x = self.c_proj(x)
         x = self.dropout(x)
         return x

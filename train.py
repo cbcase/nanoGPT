@@ -339,6 +339,8 @@ iter_num += (graph_warmups + 1)
 local_iter_num += (graph_warmups + 1)
 
 while True:
+    if iter_num == 35:
+        sys.exit(0)
     # determine and set the learning rate for this iteration
     lr = get_lr(iter_num) if decay_lr else learning_rate
     for param_group in optimizer.param_groups:
