@@ -23,6 +23,7 @@ import pickle
 from contextlib import nullcontext
 import sys
 
+from megatron.core import mpu, tensor_parallel
 import numpy as np
 import torch
 from torch.nn.parallel import DistributedDataParallel as DDP
@@ -30,8 +31,6 @@ from torch.distributed import init_process_group, destroy_process_group
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 
 from model import GPTConfig, GPT
-
-import flat
 
 # -----------------------------------------------------------------------------
 # default config values designed to train a gpt2 (124M) on OpenWebText
@@ -76,6 +75,7 @@ backend = 'nccl' # 'nccl', 'gloo', etc.
 device = 'cuda' # examples: 'cpu', 'cuda', 'cuda:0', 'cuda:1' etc., or try 'mps' on macbooks
 dtype = 'bfloat16' # 'float32', 'bfloat16', or 'float16', the latter will auto implement a GradScaler
 compile = True # use PyTorch 2.0 to compile the model to be faster
+model_parallel = 1
 # -----------------------------------------------------------------------------
 config_keys = [k for k,v in globals().items() if not k.startswith('_') and isinstance(v, (int, float, bool, str))]
 exec(open('configurator.py').read()) # overrides from command line or config file
@@ -96,6 +96,8 @@ if ddp:
     seed_offset = ddp_rank # each process gets a different seed
     assert gradient_accumulation_steps % torch.cuda.device_count() == 0
     gradient_accumulation_steps //= torch.cuda.device_count()
+    mpu.initialize_model_parallel(tensor_model_parallel_size=model_parallel)
+    tensor_parallel.model_parallel_cuda_manual_seed(1337 + seed_offset)
 else:
     # if not ddp, we are running on a single gpu, and one process
     master_process = True
@@ -203,7 +205,7 @@ scaler = torch.cuda.amp.GradScaler(enabled=(dtype == 'float16'))
 
 # Flatten the model
 optimizer, flat_model_state = model.create_flat_optimizer(weight_decay, learning_rate, (beta1, beta2),
-                                                          ddp_rank, ddp_world_size)
+                                                          mpu.get_data_parallel_rank(), mpu.get_data_parallel_world_size())
 # decay_params, nodecay_params = model.split_decay_params()
 # flat_model_state = flat.flatten_model({"decay": decay_params, "nodecay": nodecay_params})
 
@@ -221,8 +223,15 @@ if compile:
 
 # wrap model into DDP container
 if ddp:
-    torch.distributed.broadcast(flat_model_state.params(), 0)
+    torch.distributed.broadcast(flat_model_state.params(), mpu.get_data_parallel_src_rank(),
+                                group=mpu.get_data_parallel_group())
+    ###torch.distributed.broadcast(flat_model_state.params(), mpu.get_data_parallel_src_rank(),
+    ###                            mpu.get_data_parallel_group())
+    #print(ddp_rank, 'src rank', mpu.get_data_parallel_src_rank())
+    #print(ddp_rank, 'whole group', torch.distributed.get_process_group_ranks(mpu.get_data_parallel_group()))
+    #torch.distributed.broadcast(flat_model_state.params(), 0)
     # model = DDP(model, device_ids=[ddp_local_rank])
+
 
 # helps estimate an arbitrarily accurate loss over either split using many batches
 @torch.no_grad()
@@ -290,11 +299,19 @@ with torch.cuda.stream(s):
                 p.grad = None
         static_embed.grad = None
         if ddp:
-            torch.distributed.reduce_scatter_tensor(flat_model_state.dist_grads(), flat_model_state.grads())
+            ##print(ddp_rank, 'calling RS', flat_model_state.dist_grads().shape, flat_model_state.grads().shape)
+            torch.distributed.reduce_scatter_tensor(flat_model_state.dist_grads(), flat_model_state.grads(),
+                                                    group=mpu.get_data_parallel_group())
             optimizer.step()
-            torch.distributed.all_gather_into_tensor(flat_model_state.params(), flat_model_state.dist_params())
+            torch.distributed.all_gather_into_tensor(flat_model_state.params(), flat_model_state.dist_params(),
+                                                     group=mpu.get_data_parallel_group())
         else:
             optimizer.step()
+
+torch.cuda.synchronize()
+print('done with warmup')
+
+
 g = torch.cuda.CUDAGraph()
 X, Y = get_batch('train')
 lr = get_lr(iter_num + graph_warmups) if decay_lr else learning_rate
@@ -314,9 +331,11 @@ with torch.cuda.graph(g):
             p.grad = None
     static_embed.grad = None
     if ddp:
-        torch.distributed.reduce_scatter_tensor(flat_model_state.dist_grads(), flat_model_state.grads())
+        torch.distributed.reduce_scatter_tensor(flat_model_state.dist_grads(), flat_model_state.grads(),
+                                                group=mpu.get_data_parallel_group())
         optimizer.step()
-        torch.distributed.all_gather_into_tensor(flat_model_state.params(), flat_model_state.dist_params())
+        torch.distributed.all_gather_into_tensor(flat_model_state.params(), flat_model_state.dist_params(),
+                                                 group=mpu.get_data_parallel_group())
     else:
         optimizer.step()
 
